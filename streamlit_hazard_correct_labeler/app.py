@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib import error, parse, request
 
 import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
@@ -124,6 +125,97 @@ def write_human_labels(labels_path: Path, labels_by_idx: Dict[int, Dict[str, Any
             f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
+def _source_key(root: Path, source_jsonl_path: Path) -> str:
+    return str(source_jsonl_path.relative_to(root))
+
+
+def _get_secret_or_env(key: str) -> Optional[str]:
+    try:
+        value = st.secrets.get(key, None)
+    except StreamlitSecretNotFoundError:
+        value = None
+    if value:
+        return str(value)
+    env_value = os.environ.get(key)
+    return str(env_value) if env_value else None
+
+
+def _supabase_config() -> Optional[Dict[str, str]]:
+    url = _get_secret_or_env("SUPABASE_URL")
+    key = _get_secret_or_env("SUPABASE_KEY")
+    if not url or not key:
+        return None
+    table = _get_secret_or_env("SUPABASE_TABLE") or "human_labels"
+    return {"url": url.rstrip("/"), "key": key, "table": table}
+
+
+def _supabase_request_json(
+    method: str,
+    cfg: Dict[str, str],
+    query_params: Optional[Dict[str, str]] = None,
+    payload: Optional[List[Dict[str, Any]]] = None,
+    extra_headers: Optional[Dict[str, str]] = None,
+) -> Any:
+    base = f"{cfg['url']}/rest/v1/{cfg['table']}"
+    if query_params:
+        base = f"{base}?{parse.urlencode(query_params)}"
+    headers = {
+        "apikey": cfg["key"],
+        "Authorization": f"Bearer {cfg['key']}",
+        "Content-Type": "application/json",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = request.Request(base, data=data, headers=headers, method=method)
+    with request.urlopen(req, timeout=20) as resp:
+        raw = resp.read()
+        if not raw:
+            return None
+        return json.loads(raw.decode("utf-8"))
+
+
+def load_human_labels_from_db(
+    cfg: Dict[str, str], annotator_id: str, files: List[Path], root: Path
+) -> Dict[Path, Dict[int, Dict[str, Any]]]:
+    by_source: Dict[Path, Dict[int, Dict[str, Any]]] = {p: {} for p in files}
+    source_by_key: Dict[str, Path] = {_source_key(root, p): p for p in files}
+    rows = _supabase_request_json(
+        method="GET",
+        cfg=cfg,
+        query_params={
+            "select": "source_jsonl_path,idx,groundtruth_hazard,human_hazard_correct,annotator_id,note,saved_at_utc",
+            "annotator_id": f"eq.{annotator_id}",
+            "limit": "50000",
+        },
+        extra_headers={"Accept": "application/json"},
+    )
+    if not isinstance(rows, list):
+        return by_source
+    for obj in rows:
+        source_key = str(obj.get("source_jsonl_path", ""))
+        source_path = source_by_key.get(source_key)
+        idx = obj.get("idx")
+        if source_path is None or not isinstance(idx, int):
+            continue
+        by_source[source_path][idx] = obj
+    return by_source
+
+
+def write_human_labels_to_db(cfg: Dict[str, str], rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        return
+    _supabase_request_json(
+        method="POST",
+        cfg=cfg,
+        query_params={"on_conflict": "source_jsonl_path,idx,annotator_id"},
+        payload=rows,
+        extra_headers={
+            "Prefer": "resolution=merge-duplicates,return=minimal",
+        },
+    )
+
+
 def update_source_hazard_correct(source_jsonl_path: Path, idx: int, new_value: bool) -> None:
     # Rewrite source file to update exactly one row.
     rows = load_jsonl(source_jsonl_path)
@@ -190,9 +282,11 @@ def main() -> None:
     except StreamlitSecretNotFoundError:
         workspace_root = None
     root = Path(workspace_root).resolve() if workspace_root else default_root
+    db_cfg = _supabase_config()
 
     st.title("Hazard Correct Human Labeler")
     st.caption("`Sampling_aligned_triplets`의 모든 샘플을 한 화면에서 보고 true/false를 선택합니다.")
+    st.caption("`SUPABASE_URL`/`SUPABASE_KEY`가 설정되면 DB에 영구 저장됩니다.")
 
     annotator_id = st.text_input("annotator_id", value=os.environ.get("ANNOTATOR_ID", "annotator_1"))
     note = st.text_input("Optional note (applied to all saved rows)", value="")
@@ -232,9 +326,25 @@ def main() -> None:
     labels_by_source_path: Dict[Path, Dict[int, Dict[str, Any]]] = {}
     labels_paths_by_source_path: Dict[Path, Path] = {}
     for source_jsonl_path in sorted(files):
-        labels_path = src_labels_path(root, source_jsonl_path, annotator_safe)
-        labels_paths_by_source_path[source_jsonl_path] = labels_path
-        labels_by_source_path[source_jsonl_path] = load_human_labels(labels_path)
+        labels_by_source_path[source_jsonl_path] = {}
+        labels_paths_by_source_path[source_jsonl_path] = src_labels_path(root, source_jsonl_path, annotator_safe)
+
+    if db_cfg:
+        try:
+            labels_by_source_path = load_human_labels_from_db(db_cfg, annotator_safe, sorted(files), root)
+            st.info("Storage backend: Supabase DB")
+        except (error.URLError, error.HTTPError, TimeoutError, ValueError) as e:
+            st.warning(f"DB load failed; fallback to file storage. ({e})")
+            for source_jsonl_path in sorted(files):
+                labels_by_source_path[source_jsonl_path] = load_human_labels(
+                    labels_paths_by_source_path[source_jsonl_path]
+                )
+    else:
+        st.info("Storage backend: local files (`human_labels`) ")
+        for source_jsonl_path in sorted(files):
+            labels_by_source_path[source_jsonl_path] = load_human_labels(
+                labels_paths_by_source_path[source_jsonl_path]
+            )
 
     # Render all samples.
     st.markdown("## Review (all samples)")
@@ -284,7 +394,7 @@ def main() -> None:
             key = f"label::{annotator_safe}::{pos}"
             selected = bool(st.session_state.get(key, False))
             labels_by_source_path[source_jsonl_path][item.idx] = {
-                "source_jsonl_path": str(source_jsonl_path),
+                "source_jsonl_path": _source_key(root, source_jsonl_path),
                 "idx": item.idx,
                 "groundtruth_hazard": item.groundtruth_hazard,
                 "human_hazard_correct": selected,
@@ -293,11 +403,23 @@ def main() -> None:
                 "saved_at_utc": _now_utc_iso(),
             }
 
-        for source_jsonl_path in sorted(labels_paths_by_source_path.keys()):
-            write_human_labels(
-                labels_paths_by_source_path[source_jsonl_path],
-                labels_by_source_path[source_jsonl_path],
-            )
+        if db_cfg:
+            try:
+                rows_to_upsert: List[Dict[str, Any]] = []
+                for source_jsonl_path in sorted(labels_by_source_path.keys()):
+                    rows_to_upsert.extend(
+                        [labels_by_source_path[source_jsonl_path][i] for i in sorted(labels_by_source_path[source_jsonl_path].keys())]
+                    )
+                write_human_labels_to_db(db_cfg, rows_to_upsert)
+            except (error.URLError, error.HTTPError, TimeoutError, ValueError) as e:
+                st.error(f"DB save failed: {e}")
+                return
+        else:
+            for source_jsonl_path in sorted(labels_paths_by_source_path.keys()):
+                write_human_labels(
+                    labels_paths_by_source_path[source_jsonl_path],
+                    labels_by_source_path[source_jsonl_path],
+                )
 
         # 2) Optional overwrite source jsonl (aligned data)
         if overwrite_source:
